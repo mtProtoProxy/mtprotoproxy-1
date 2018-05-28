@@ -1,5 +1,7 @@
 PORT = 3256
 
-# use only these chars in SECRET: 0123456789abcdef
-# the length of secret should be 32
-SECRET = '00000000000000000000000000000000'
+# name -> secret (32 hex chars)
+USERS = {
+    "tg":  "00000000000000000000000000000000",
+    "tg2": "0123456789abcdef0123456789abcdef"
+}
