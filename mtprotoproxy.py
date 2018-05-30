@@ -3,6 +3,7 @@
 import asyncio
 import socket
 import urllib.parse
+import urllib.request
 import collections
 import time
 import hashlib
@@ -27,15 +28,23 @@ except ModuleNotFoundError:
 
 from config import PORT, USERS
 
-TG_DATACENTERS = [
+TG_DATACENTERS_V4 = [
     "149.154.175.50", "149.154.167.51", "149.154.175.100",
     "149.154.167.91", "149.154.171.5"
+]
+
+TG_DATACENTERS_V6 = [
+    "2001:0b28:f23d:f001::a", "2001:067c:04e8:f002::a",
+    "2001:0b28:f23d:f003::a", "2001:067c:04e8:f004::a",
+    "2001:0b28:f23f:f005::a",
 ]
 
 TG_DATACENTER_PORT = 443
 
 # disables tg->client trafic reencryption, faster but less secure
 FAST_MODE = True
+
+PREFER_IPV6 = False
 
 STATS_PRINT_PERIOD = 600
 READ_BUF_SIZE = 4096
@@ -48,6 +57,7 @@ HANDSHAKE_LEN = 64
 MAGIC_VAL_POS = 56
 
 MAGIC_VAL_TO_CHECK = b'\xef\xef\xef\xef'
+
 
 def init_stats():
     global stats
@@ -81,17 +91,21 @@ async def handle_handshake(reader, writer):
         encryptor = create_aes(key=enc_key, iv=int.from_bytes(enc_iv, "big"))
 
         decrypted = decryptor.decrypt(handshake)
-        
+
         check_val = decrypted[MAGIC_VAL_POS:MAGIC_VAL_POS+4]
         if check_val != MAGIC_VAL_TO_CHECK:
             continue
 
         dc_idx = abs(int.from_bytes(decrypted[60:62], "little", signed=True)) - 1
 
-        if dc_idx < 0 or dc_idx >= len(TG_DATACENTERS):
-            continue
-
-        dc = TG_DATACENTERS[dc_idx]
+        if PREFER_IPV6:
+            if not 0 <= dc_idx < len(TG_DATACENTERS_V6):
+                continue
+            dc = TG_DATACENTERS_V6[dc_idx]
+        else:
+            if not 0 <= dc_idx < len(TG_DATACENTERS_V4):
+                continue
+            dc = TG_DATACENTERS_V4[dc_idx]
 
         return encryptor, decryptor, user, dc, enc_key + enc_iv
     return False
@@ -134,7 +148,7 @@ async def do_handshake(dc, dec_key_and_iv=None):
     enc_key_and_iv = rnd[SKIP_LEN:SKIP_LEN+KEY_LEN+IV_LEN]
     enc_key, enc_iv = enc_key_and_iv[:KEY_LEN], enc_key_and_iv[KEY_LEN:]
     encryptor = create_aes(key=enc_key, iv=int.from_bytes(enc_iv, "big"))
-    
+
     rnd_enc = rnd[:MAGIC_VAL_POS] + encryptor.encrypt(rnd)[MAGIC_VAL_POS:]
 
     writer_tgt.write(rnd_enc)
@@ -190,7 +204,8 @@ async def handle_client(reader, writer):
         finally:
             update_stats(user, curr_connects_x2=-1)
 
-    asyncio.ensure_future(connect_reader_to_writer(reader_tg, writer, tg_dec, clt_enc, user, fast=FAST_MODE))
+    asyncio.ensure_future(connect_reader_to_writer(reader_tg, writer, tg_dec, clt_enc, user,
+                                                   fast=FAST_MODE))
     asyncio.ensure_future(connect_reader_to_writer(reader, writer_tg, clt_dec, tg_enc, user))
 
 
@@ -215,23 +230,20 @@ async def stats_printer():
 
 
 def print_tg_info():
-    my_ip = socket.gethostbyname(socket.gethostname())
+    try:
+        with urllib.request.urlopen('https://ifconfig.co/ip') as f:
+            if f.status != 200:
+                raise Exception("Invalid status code")
+            my_ip = f.read().strip()
+    except Exception:
+        my_ip = 'YOUR_IP'
 
-    octets = [int(o) for o in my_ip.split(".")]
-
-    ip_is_local = (len(octets) == 4 and (
-        octets[0] in [127, 10] or
-        octets[0:2] == [192, 168] or
-        (octets[0] == 172 and 16 <= octets[1] <= 31)))
-
-    if ip_is_local:
-        my_ip = "YOUR_IP"
-
-    for user, secret in USERS.items():
+    for user, secret in sorted(USERS.items(), key=lambda x: x[0]):
         params = {
             "server": my_ip, "port": PORT, "secret": secret
         }
-        print("tg://proxy?" + urllib.parse.urlencode(params), flush=True)
+        params_encodeded = urllib.parse.urlencode(params, safe=':')
+        print("{}: tg://proxy?{}".format(user, params_encodeded, flush=True))
 
 
 def main():
@@ -240,9 +252,15 @@ def main():
     loop = asyncio.get_event_loop()
     stats_printer_task = asyncio.Task(stats_printer())
     asyncio.ensure_future(stats_printer_task)
-    task = asyncio.start_server(handle_client_wrapper,
-                                "0.0.0.0", PORT, loop=loop)
-    server = loop.run_until_complete(task)
+
+    task_v4 = asyncio.start_server(handle_client_wrapper,
+                                   '0.0.0.0', PORT, loop=loop)
+    server_v4 = loop.run_until_complete(task_v4)
+
+    if socket.has_ipv6:
+        task_v6 = asyncio.start_server(handle_client_wrapper,
+                                       '::', PORT, loop=loop)
+        server_v6 = loop.run_until_complete(task_v6)
 
     try:
         loop.run_forever()
@@ -251,8 +269,13 @@ def main():
 
     stats_printer_task.cancel()
 
-    server.close()
-    loop.run_until_complete(server.wait_closed())
+    server_v4.close()
+    loop.run_until_complete(server_v4.wait_closed())
+
+    if socket.has_ipv6:
+        server_v6.close()
+        loop.run_until_complete(server_v6.wait_closed())
+
     loop.close()
 
 
