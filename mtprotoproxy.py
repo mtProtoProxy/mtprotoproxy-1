@@ -9,6 +9,9 @@ import time
 import hashlib
 import random
 import binascii
+import sys
+import re
+
 
 try:
     from Crypto.Cipher import AES
@@ -22,7 +25,8 @@ try:
         return AES.new(key, AES.MODE_CBC, iv)
 
 except ImportError:
-    print("Failed to find pycrypto, using slow AES version", flush=True)
+    print("Failed to find pycryptodome or pycrypto, using slow AES implementation",
+          flush=True, file=sys.stderr)
     import pyaes
 
     def create_aes_ctr(key, iv):
@@ -46,16 +50,29 @@ except ImportError:
         return EncryptorAdapter(mode)
 
 
+try:
+    import resource
+    soft_fd_limit, hard_fd_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (hard_fd_limit, hard_fd_limit))
+except (ValueError, OSError):
+    print("Failed to increase the limit of opened files", flush=True, file=sys.stderr)
+except ImportError:
+    pass
+
+
 import config
 PORT = getattr(config, "PORT")
 USERS = getattr(config, "USERS")
 
 # load advanced settings
-PREFER_IPV6 = getattr(config, "PREFER_IPV6", False)
+PREFER_IPV6 = getattr(config, "PREFER_IPV6", socket.has_ipv6)
 # disables tg->client trafic reencryption, faster but less secure
 FAST_MODE = getattr(config, "FAST_MODE", True)
 STATS_PRINT_PERIOD = getattr(config, "STATS_PRINT_PERIOD", 600)
-READ_BUF_SIZE = getattr(config, "READ_BUF_SIZE", 4096)
+PROXY_INFO_UPDATE_PERIOD = getattr(config, "PROXY_INFO_UPDATE_PERIOD", 60*60*24)
+READ_BUF_SIZE = getattr(config, "READ_BUF_SIZE", 16384)
+WRITE_BUF_SIZE = getattr(config, "WRITE_BUF_SIZE", 65536)
+CLIENT_KEEPALIVE = getattr(config, "CLIENT_KEEPALIVE", 60*30)
 AD_TAG = bytes.fromhex(getattr(config, "AD_TAG", ""))
 
 TG_DATACENTER_PORT = 443
@@ -70,18 +87,22 @@ TG_DATACENTERS_V6 = [
     "2001:67c:04e8:f004::a", "2001:b28:f23f:f005::a"
 ]
 
-TG_MIDDLE_PROXIES_V4 = [
-    ("149.154.175.50", 8888), ("149.154.162.38", 80), ("149.154.175.100", 8888),
-    ("91.108.4.136", 8888), ("91.108.56.181", 8888)
-]
+# This list will be updated in the runtime
+TG_MIDDLE_PROXIES_V4 = {
+    1: [("149.154.175.50", 8888)], -1: [("149.154.175.50", 8888)],
+    2: [("149.154.162.38", 80)], -2: [("149.154.162.38", 80)],
+    3: [("149.154.175.100", 8888)], -3: [("149.154.175.100", 8888)],
+    4: [("91.108.4.136", 8888)], -4: [("91.108.4.136", 8888)],
+    5: [("91.108.56.181", 8888)], -5: [("91.108.56.181", 8888)]
+}
 
-TG_MIDDLE_PROXIES_V6 = [
-    ("2001:0b28:f23d:f001:0000:0000:0000:000d", 8888),
-    ("2001:067c:04e8:f002:0000:0000:0000:000d", 80),
-    ("2001:0b28:f23d:f003:0000:0000:0000:000d", 8888),
-    ("2001:067c:04e8:f004:0000:0000:0000:000d", 8888),
-    ("2001:0b28:f23f:f005:0000:0000:0000:000d", 8888)
-]
+TG_MIDDLE_PROXIES_V6 = {
+    1: [("2001:b28:f23d:f001::d", 8888)], -1: [("2001:b28:f23d:f001::d", 8888)],
+    2: [("2001:67c:04e8:f002::d", 80)], -2: [("2001:67c:04e8:f002::d", 80)],
+    3: [("2001:b28:f23d:f003::d", 8888)], -3: [("2001:b28:f23d:f003::d", 8888)],
+    4: [("2001:67c:04e8:f004::d", 8888)], -4: [("2001:67c:04e8:f004::d", 8888)],
+    5: [("2001:b28:f23f:f005::d", 8888)], -5: [("2001:67c:04e8:f004::d", 8888)]
+}
 
 
 USE_MIDDLE_PROXY = (len(AD_TAG) == 16)
@@ -99,6 +120,7 @@ KEY_LEN = 32
 IV_LEN = 16
 HANDSHAKE_LEN = 64
 MAGIC_VAL_POS = 56
+DC_IDX_POS = 60
 
 MAGIC_VAL_TO_CHECK = b'\xef\xef\xef\xef'
 
@@ -109,6 +131,10 @@ MIN_MSG_LEN = 12
 MAX_MSG_LEN = 2 ** 24
 
 my_ip_info = {"ipv4": None, "ipv6": None}
+
+
+def print_err(*params):
+    print(*params, file=sys.stderr, flush=True)
 
 
 def init_stats():
@@ -144,11 +170,21 @@ class LayeredStreamWriterBase:
     def write(self, data):
         return self.upstream.write(data)
 
+    def write_eof(self):
+        return self.upstream.write_eof()
+
     async def drain(self):
         return await self.upstream.drain()
 
     def close(self):
         return self.upstream.close()
+
+    def abort(self):
+        return self.upstream.transport.abort()
+
+    @property
+    def transport(self):
+        return self.upstream.transport
 
 
 class CryptoWrappedStreamReader(LayeredStreamReaderBase):
@@ -195,8 +231,8 @@ class CryptoWrappedStreamWriter(LayeredStreamWriterBase):
 
     def write(self, data):
         if len(data) % self.block_size != 0:
-            print("BUG: writing %d bytes not aligned to block size %d" % (
-                len(data), self.block_size))
+            print_err("BUG: writing %d bytes not aligned to block size %d" % (
+                      len(data), self.block_size))
             return 0
         q = self.encryptor.encrypt(data)
         return self.upstream.write(q)
@@ -217,13 +253,13 @@ class MTProtoFrameStreamReader(LayeredStreamReaderBase):
 
         len_is_bad = (msg_len % len(PADDING_FILLER) != 0)
         if not MIN_MSG_LEN <= msg_len <= MAX_MSG_LEN or len_is_bad:
-            print("msg_len is bad, closing connection", msg_len)
+            print_err("msg_len is bad, closing connection", msg_len)
             return b""
 
         msg_seq_bytes = await self.upstream.readexactly(4)
         msg_seq = int.from_bytes(msg_seq_bytes, "little", signed=True)
         if msg_seq != self.seq_no:
-            print("unexpected seq_no")
+            print_err("unexpected seq_no")
             return b""
 
         self.seq_no += 1
@@ -286,7 +322,7 @@ class MTProtoCompactFrameStreamWriter(LayeredStreamWriterBase):
         LARGE_PKT_BORGER = 256 ** 3
 
         if len(data) % 4 != 0:
-            print("BUG: MTProtoFrameStreamWriter attempted to send msg with len %d" % len(msg))
+            print_err("BUG: MTProtoFrameStreamWriter attempted to send msg with len %d" % len(data))
             return 0
 
         len_div_four = len(data) // 4
@@ -295,9 +331,9 @@ class MTProtoCompactFrameStreamWriter(LayeredStreamWriterBase):
             return self.upstream.write(bytes([len_div_four]) + data)
         elif len_div_four < LARGE_PKT_BORGER:
             return self.upstream.write(b'\x7f' + bytes(int.to_bytes(len_div_four, 3, 'little')) +
-                                     data)
+                                       data)
         else:
-            print("Attempted to send too large pkt len =", len(data))
+            print_err("Attempted to send too large pkt len =", len(data))
             return 0
 
 
@@ -316,7 +352,7 @@ class ProxyReqStreamReader(LayeredStreamReaderBase):
             return b""
 
         if ans_type != RPC_PROXY_ANS:
-            print("ans_type != RPC_PROXY_ANS", ans_type)
+            print_err("ans_type != RPC_PROXY_ANS", ans_type)
             return b""
 
         return conn_data
@@ -325,7 +361,7 @@ class ProxyReqStreamReader(LayeredStreamReaderBase):
 class ProxyReqStreamWriter(LayeredStreamWriterBase):
     def __init__(self, upstream, cl_ip, cl_port, my_ip, my_port):
         self.upstream = upstream
-        
+
         if ":" not in cl_ip:
             self.remote_ip_port = b"\x00" * 10 + b"\xff\xff"
             self.remote_ip_port += socket.inet_pton(socket.AF_INET, cl_ip)
@@ -339,21 +375,21 @@ class ProxyReqStreamWriter(LayeredStreamWriterBase):
         else:
             self.our_ip_port = socket.inet_pton(socket.AF_INET6, my_ip)
         self.our_ip_port += int.to_bytes(my_port, 4, "little")
+        self.out_conn_id = bytearray([random.randrange(0, 256) for i in range(8)])
 
     def write(self, msg):
         RPC_PROXY_REQ = b"\xee\xf1\xce\x36"
         FLAGS = b"\x08\x10\x02\x40"
-        OUT_CONN_ID = bytearray([random.randrange(0, 256) for i in range(8)])
         EXTRA_SIZE = b"\x18\x00\x00\x00"
         PROXY_TAG = b"\xae\x26\x1e\xdb"
         FOUR_BYTES_ALIGNER = b"\x00\x00\x00"
 
         if len(msg) % 4 != 0:
-            print("BUG: attempted to send msg with len %d" % len(msg))
+            print_err("BUG: attempted to send msg with len %d" % len(msg))
             return 0
 
         full_msg = bytearray()
-        full_msg += RPC_PROXY_REQ + FLAGS + OUT_CONN_ID + self.remote_ip_port
+        full_msg += RPC_PROXY_REQ + FLAGS + self.out_conn_id + self.remote_ip_port
         full_msg += self.our_ip_port + EXTRA_SIZE + PROXY_TAG
         full_msg += bytes([len(AD_TAG)]) + AD_TAG + FOUR_BYTES_ALIGNER
         full_msg += msg
@@ -383,9 +419,7 @@ async def handle_handshake(reader, writer):
         if check_val != MAGIC_VAL_TO_CHECK:
             continue
 
-        dc_idx = abs(int.from_bytes(decrypted[60:62], "little", signed=True)) - 1
-        if dc_idx == 0:
-            continue
+        dc_idx = int.from_bytes(decrypted[DC_IDX_POS:DC_IDX_POS+2], "little", signed=True)
 
         reader = CryptoWrappedStreamReader(reader, decryptor)
         writer = CryptoWrappedStreamWriter(writer, encryptor)
@@ -399,6 +433,8 @@ async def do_direct_handshake(dc_idx, dec_key_and_iv=None):
                                 b"\x47\x45\x54\x20", b"\xee\xee\xee\xee"]
     RESERVED_NONCE_CONTINUES = [b"\x00\x00\x00\x00"]
 
+    dc_idx = abs(dc_idx) - 1
+
     if PREFER_IPV6:
         if not 0 <= dc_idx < len(TG_DATACENTERS_V6):
             return False
@@ -409,10 +445,13 @@ async def do_direct_handshake(dc_idx, dec_key_and_iv=None):
         dc = TG_DATACENTERS_V4[dc_idx]
 
     try:
-        reader_tgt, writer_tgt = await asyncio.open_connection(dc, TG_DATACENTER_PORT)
+        reader_tgt, writer_tgt = await asyncio.open_connection(dc, TG_DATACENTER_PORT,
+                                                               limit=READ_BUF_SIZE)
     except ConnectionRefusedError as E:
+        print_err("Got connection refused while trying to connect to", dc, TG_DATACENTER_PORT)
         return False
     except OSError as E:
+        print_err("Unable to connect to", dc, TG_DATACENTER_PORT)
         return False
 
     while True:
@@ -477,6 +516,21 @@ def get_middleproxy_aes_key_and_iv(nonce_srv, nonce_clt, clt_ts, srv_ip, clt_por
     return key, iv
 
 
+def set_keepalive(sock, interval=40, attempts=5):
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, interval)
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, interval)
+    if hasattr(socket, "TCP_KEEPCNT"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, attempts)
+
+
+def set_bufsizes(sock, recv_buf=READ_BUF_SIZE, send_buf=WRITE_BUF_SIZE):
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, recv_buf)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, send_buf)
+
+
 async def do_middleproxy_handshake(dc_idx, cl_ip, cl_port):
     START_SEQ_NO = -2
     NONCE_LEN = 16
@@ -494,20 +548,24 @@ async def do_middleproxy_handshake(dc_idx, cl_ip, cl_port):
     use_ipv6_tg = PREFER_IPV6
     use_ipv6_clt = (":" in cl_ip)
 
-    if use_ipv6_tg:  # commented out because they aren't work yet
-        if not 0 <= dc_idx < len(TG_MIDDLE_PROXIES_V6):
+    if use_ipv6_tg:
+        if dc_idx not in TG_MIDDLE_PROXIES_V6:
             return False
-        addr, port = TG_MIDDLE_PROXIES_V6[dc_idx]
+        addr, port = random.choice(TG_MIDDLE_PROXIES_V6[dc_idx])
     else:
-        if not 0 <= dc_idx < len(TG_MIDDLE_PROXIES_V4):
+        if dc_idx not in TG_MIDDLE_PROXIES_V4:
             return False
-        addr, port = TG_MIDDLE_PROXIES_V4[dc_idx]
+        addr, port = random.choice(TG_MIDDLE_PROXIES_V4[dc_idx])
 
     try:
-        reader_tgt, writer_tgt = await asyncio.open_connection(addr, port)
+        reader_tgt, writer_tgt = await asyncio.open_connection(addr, port, limit=READ_BUF_SIZE)
+        set_keepalive(writer_tgt.get_extra_info("socket"))
+        set_bufsizes(writer_tgt.get_extra_info("socket"))
     except ConnectionRefusedError as E:
+        print_err("Got connection refused while trying to connect to", addr, port)
         return False
     except OSError as E:
+        print_err("Unable to connect to", addr, port)
         return False
 
     writer_tgt = MTProtoFrameStreamWriter(writer_tgt, START_SEQ_NO)
@@ -545,7 +603,7 @@ async def do_middleproxy_handshake(dc_idx, cl_ip, cl_port):
         if my_ip_info["ipv4"]:
             # prefer global ip settings to work behind NAT
             my_ip = my_ip_info["ipv4"]
-            
+
         tg_ip_bytes = socket.inet_pton(socket.AF_INET, tg_ip)[::-1]
         my_ip_bytes = socket.inet_pton(socket.AF_INET, my_ip)[::-1]
 
@@ -605,9 +663,12 @@ async def do_middleproxy_handshake(dc_idx, cl_ip, cl_port):
 
 
 async def handle_client(reader_clt, writer_clt):
+    set_keepalive(writer_clt.get_extra_info("socket"), CLIENT_KEEPALIVE)
+    set_bufsizes(writer_clt.get_extra_info("socket"))
+
     clt_data = await handle_handshake(reader_clt, writer_clt)
     if not clt_data:
-        writer_clt.close()
+        writer_clt.transport.abort()
         return
 
     reader_clt, writer_clt, user, dc_idx, enc_key_and_iv = clt_data
@@ -624,7 +685,7 @@ async def handle_client(reader_clt, writer_clt):
         tg_data = await do_middleproxy_handshake(dc_idx, cl_ip, cl_port)
 
     if not tg_data:
-        writer_clt.close()
+        writer_clt.transport.abort()
         return
 
     reader_tg, writer_tg = tg_data
@@ -659,11 +720,11 @@ async def handle_client(reader_clt, writer_clt):
                     update_stats(user, octets=len(data))
                     wr.write(data)
                     await wr.drain()
-        except (ConnectionResetError, BrokenPipeError, OSError,
-                AttributeError, asyncio.streams.IncompleteReadError) as e:
-            wr.close()
-            # print(e)
+        except (OSError, AttributeError, asyncio.streams.IncompleteReadError) as e:
+            # print_err(e)
+            pass
         finally:
+            wr.transport.abort()
             update_stats(user, curr_connects_x2=-1)
 
     asyncio.ensure_future(connect_reader_to_writer(reader_tg, writer_clt, user))
@@ -673,8 +734,8 @@ async def handle_client(reader_clt, writer_clt):
 async def handle_client_wrapper(reader, writer):
     try:
         await handle_client(reader, writer)
-    except (asyncio.IncompleteReadError, ConnectionResetError):
-        writer.close()
+    except (asyncio.IncompleteReadError, ConnectionResetError, TimeoutError):
+        writer.transport.abort()
 
 
 async def stats_printer():
@@ -690,10 +751,90 @@ async def stats_printer():
         print(flush=True)
 
 
+async def update_middle_proxy_info():
+    async def make_https_req(url):
+        # returns resp body
+        SSL_PORT = 443
+        url_data = urllib.parse.urlparse(url)
+
+        HTTP_REQ_TEMPLATE = "\r\n".join(["GET %s HTTP/1.1", "Host: core.telegram.org",
+                                         "Connection: close"]) + "\r\n\r\n"
+        try:
+            reader, writer = await asyncio.open_connection(url_data.netloc, SSL_PORT, ssl=True)
+            req = HTTP_REQ_TEMPLATE % urllib.parse.quote(url_data.path)
+            writer.write(req.encode("utf8"))
+            data = await reader.read()
+            writer.close()
+
+            headers, body = data.split(b"\r\n\r\n", 1)
+            return body
+        except Exception:
+            return b""
+
+    async def get_new_proxies(url):
+        PROXY_REGEXP = re.compile(r"proxy_for\s+(-?\d+)\s+(.+):(\d+)\s*;")
+
+        ans = {}
+        try:
+            body = await make_https_req(url)
+        except Exception:
+            return ans
+
+        fields = PROXY_REGEXP.findall(body.decode("utf8"))
+        if fields:
+            for dc_idx, host, port in fields:
+                if host.startswith("[") and host.endswith("]"):
+                    host = host[1:-1]
+                dc_idx, port = int(dc_idx), int(port)
+                if dc_idx not in ans:
+                    ans[dc_idx] = [(host, port)]
+                else:
+                    ans[dc_idx].append((host, port))
+        return ans
+
+    PROXY_INFO_ADDR = "https://core.telegram.org/getProxyConfig"
+    PROXY_INFO_ADDR_V6 = "https://core.telegram.org/getProxyConfigV6"
+    PROXY_SECRET_ADDR = "https://core.telegram.org/getProxySecret"
+
+    global TG_MIDDLE_PROXIES_V4
+    global TG_MIDDLE_PROXIES_V6
+    global PROXY_SECRET
+
+    while True:
+        try:
+            v4_proxies = await get_new_proxies(PROXY_INFO_ADDR)
+            if not v4_proxies:
+                raise Exception("no proxy data")
+            TG_MIDDLE_PROXIES_V4 = v4_proxies
+        except Exception:
+            print_err("Error updating middle proxy list")
+
+        try:
+            v6_proxies = await get_new_proxies(PROXY_INFO_ADDR_V6)
+            if not v6_proxies:
+                raise Exception("no proxy data (ipv6)")
+            TG_MIDDLE_PROXIES_V6 = v6_proxies
+        except Exception:
+            print_err("Error updating middle proxy list for IPv6")
+
+        try:
+            secret = await make_https_req(PROXY_SECRET_ADDR)
+            if not secret:
+                raise Exception("no secret")
+            if secret != PROXY_SECRET:
+                PROXY_SECRET = secret
+                print_err("Middle proxy secret updated")
+        except Exception:
+            print_err("Error updating middle proxy secret, using old")
+
+        await asyncio.sleep(PROXY_INFO_UPDATE_PERIOD)
+
+
 def init_ip_info():
-    TIMEOUT = 5
     global USE_MIDDLE_PROXY
+    global PREFER_IPV6
     global my_ip_info
+    TIMEOUT = 5
 
     try:
         with urllib.request.urlopen('https://v4.ifconfig.co/ip', timeout=TIMEOUT) as f:
@@ -703,17 +844,22 @@ def init_ip_info():
     except Exception:
         pass
 
-    try:
-        with urllib.request.urlopen('https://v6.ifconfig.co/ip', timeout=TIMEOUT) as f:
-            if f.status != 200:
-                raise Exception("Invalid status code")
-            my_ip_info["ipv6"] = f.read().decode().strip()
-    except Exception:
-        pass
+    if PREFER_IPV6:
+        try:
+            with urllib.request.urlopen('https://v6.ifconfig.co/ip', timeout=TIMEOUT) as f:
+                if f.status != 200:
+                    raise Exception("Invalid status code")
+                my_ip_info["ipv6"] = f.read().decode().strip()
+        except Exception:
+            PREFER_IPV6 = False
+        else:
+            print_err("IPv6 found, using it for external communication")
 
-    if USE_MIDDLE_PROXY and not my_ip_info["ipv4"]:  # and not my_ip_info["ipv6"]:
-        print("Failed to determine your ip, advertising disabled", flush=True)
-        USE_MIDDLE_PROXY = False
+    if USE_MIDDLE_PROXY:
+        if ((not PREFER_IPV6 and not my_ip_info["ipv4"]) or
+                (PREFER_IPV6 and not my_ip_info["ipv6"])):
+            print_err("Failed to determine your ip, advertising disabled")
+            USE_MIDDLE_PROXY = False
 
 
 def print_tg_info():
@@ -730,20 +876,49 @@ def print_tg_info():
             print("{}: tg://proxy?{}".format(user, params_encodeded), flush=True)
 
 
+def loop_exception_handler(loop, context):
+    exception = context.get("exception")
+    transport = context.get("transport")
+    if exception:
+        if isinstance(exception, TimeoutError):
+            if transport:
+                print_err("Timeout, killing transport")
+                transport.abort()
+                return
+        if isinstance(exception, OSError):
+            IGNORE_ERRNO = {
+                10038  # operation on non-socket on Windows, likely because fd == -1
+            }
+            if exception.errno in IGNORE_ERRNO:
+                return
+
+    loop.default_exception_handler(context)
+
+
 def main():
     init_stats()
 
+    if sys.platform == 'win32':
+        loop = asyncio.ProactorEventLoop()
+        asyncio.set_event_loop(loop)
+
     loop = asyncio.get_event_loop()
+    loop.set_exception_handler(loop_exception_handler)
+
     stats_printer_task = asyncio.Task(stats_printer())
     asyncio.ensure_future(stats_printer_task)
 
+    if USE_MIDDLE_PROXY:
+        middle_proxy_updater_task = asyncio.Task(update_middle_proxy_info())
+        asyncio.ensure_future(middle_proxy_updater_task)
+
     task_v4 = asyncio.start_server(handle_client_wrapper,
-                                   '0.0.0.0', PORT, loop=loop)
+                                   '0.0.0.0', PORT, limit=READ_BUF_SIZE, loop=loop)
     server_v4 = loop.run_until_complete(task_v4)
 
     if socket.has_ipv6:
         task_v6 = asyncio.start_server(handle_client_wrapper,
-                                       '::', PORT, loop=loop)
+                                       '::', PORT, limit=READ_BUF_SIZE, loop=loop)
         server_v6 = loop.run_until_complete(task_v6)
 
     try:
