@@ -1,15 +1,15 @@
-FROM alpine:3.8
+FROM alpine:3.10
 
 RUN adduser tgproxy -u 10000 -D
 
 RUN apk add --no-cache python3 py3-cryptography ca-certificates libcap
 
-COPY mtprotoproxy.py config.py /home/tgproxy/
-
 RUN chown -R tgproxy:tgproxy /home/tgproxy
-RUN setcap cap_net_bind_service=+ep /usr/bin/python3.6
+RUN setcap cap_net_bind_service=+ep /usr/bin/python3.7
+
+COPY mtprotoproxy.py config.py /home/tgproxy/
 
 USER tgproxy
 
 WORKDIR /home/tgproxy/
-CMD ["./mtprotoproxy.py"]
+CMD ["python3", "mtprotoproxy.py"]
