@@ -1,15 +1,14 @@
-FROM alpine:3.10
+FROM ubuntu:20.04
 
-RUN adduser tgproxy -u 10000 -D
+RUN apt-get update && apt-get install --no-install-recommends -y python3 python3-uvloop python3-cryptography libcap2-bin ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN setcap cap_net_bind_service=+ep /usr/bin/python3.8
 
-RUN apk add --no-cache python3 py3-cryptography ca-certificates libcap
-
-RUN chown -R tgproxy:tgproxy /home/tgproxy
-RUN setcap cap_net_bind_service=+ep /usr/bin/python3.7
-
-COPY mtprotoproxy.py config.py /home/tgproxy/
+RUN useradd tgproxy -u 10000
 
 USER tgproxy
 
 WORKDIR /home/tgproxy/
+
+COPY --chown=tgproxy mtprotoproxy.py config.py /home/tgproxy/
+
 CMD ["python3", "mtprotoproxy.py"]

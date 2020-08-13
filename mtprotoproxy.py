@@ -93,6 +93,9 @@ last_clients_with_same_handshake = collections.Counter()
 proxy_start_time = 0
 proxy_links = []
 
+stats = collections.Counter()
+user_stats = collections.defaultdict(collections.Counter)
+
 config = {}
 
 
@@ -122,6 +125,15 @@ def init_config():
     conf_dict.setdefault("PORT", 3256)
     conf_dict.setdefault("USERS", {"tg":  "00000000000000000000000000000000"})
     conf_dict["AD_TAG"] = bytes.fromhex(conf_dict.get("AD_TAG", ""))
+
+    for user, secret in conf_dict["USERS"].items():
+        if not re.fullmatch("[0-9a-fA-F]{32}", secret):
+            fixed_secret = re.sub(r"[^0-9a-fA-F]", "", secret).zfill(32)[:32]
+
+            print_err("Bad secret for user %s, should be 32 hex chars, got %s. " % (user, secret))
+            print_err("Changing it to %s" % fixed_secret)
+
+            conf_dict["USERS"][user] = fixed_secret
 
     # load advanced settings
 
@@ -183,6 +195,9 @@ def init_config():
 
     # the next host to forward bad clients
     conf_dict.setdefault("MASK_HOST", conf_dict["TLS_DOMAIN"])
+    
+    # set the home domain for the proxy, has an influence only on the log message
+    conf_dict.setdefault("MY_DOMAIN", False)
 
     # the next host's port to forward bad clients
     conf_dict.setdefault("MASK_PORT", 443)
@@ -212,6 +227,9 @@ def init_config():
 
     # length of used handshake randoms for active fingerprinting protection, zero to disable
     conf_dict.setdefault("REPLAY_CHECK_LEN", 65536)
+
+    # accept clients with bad clocks. This reduces the protection against replay attacks
+    conf_dict.setdefault("IGNORE_TIME_SKEW", False)
 
     # length of last client ip addresses for logging
     conf_dict.setdefault("CLIENT_IPS_LEN", 131072)
@@ -380,12 +398,11 @@ def print_err(*params):
     print(*params, file=sys.stderr, flush=True)
 
 
-def init_stats():
-    global stats
+def ensure_users_in_user_stats():
     global user_stats
 
-    stats = collections.Counter()
-    user_stats = {user: collections.Counter() for user in config.USERS}
+    for user in config.USERS:
+        user_stats[user].update()
 
 
 def init_proxy_start_time():
@@ -400,9 +417,6 @@ def update_stats(**kw_stats):
 
 def update_user_stats(user, **kw_stats):
     global user_stats
-
-    if user not in user_stats:
-        user_stats[user] = collections.Counter()
     user_stats[user].update(**kw_stats)
 
 
@@ -982,6 +996,24 @@ def gen_x25519_public_key():
     return int.to_bytes((n*n) % P, length=32, byteorder="little")
 
 
+async def connect_reader_to_writer(reader, writer):
+    BUF_SIZE = 8192
+    try:
+        while True:
+            data = await reader.read(BUF_SIZE)
+
+            if not data:
+                if not writer.transport.is_closing():
+                    writer.write_eof()
+                    await writer.drain()
+                return
+
+            writer.write(data)
+            await writer.drain()
+    except (OSError, asyncio.IncompleteReadError) as e:
+        pass
+
+
 async def handle_bad_client(reader_clt, writer_clt, handshake):
     BUF_SIZE = 8192
     CONNECT_TIMEOUT = 5
@@ -1000,22 +1032,6 @@ async def handle_bad_client(reader_clt, writer_clt, handshake):
             # just consume all the data
             pass
         return
-
-    async def connect_reader_to_writer(reader, writer):
-        try:
-            while True:
-                data = await reader.read(BUF_SIZE)
-
-                if not data:
-                    if not writer.transport.is_closing():
-                        writer.write_eof()
-                        await writer.drain()
-                    return
-
-                writer.write(data)
-                await writer.drain()
-        except OSError:
-            pass
 
     writer_srv = None
     try:
@@ -1088,14 +1104,14 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
     tls_extensions = b"\x00\x2e" + b"\x00\x33\x00\x24" + b"\x00\x1d\x00\x20"
     tls_extensions += gen_x25519_public_key() + b"\x00\x2b\x00\x02\x03\x04"
 
-    digest = handshake[DIGEST_POS: DIGEST_POS + DIGEST_LEN]
+    digest = handshake[DIGEST_POS:DIGEST_POS+DIGEST_LEN]
 
     if digest[:DIGEST_HALFLEN] in used_handshakes:
         last_clients_with_same_handshake[peer[0]] += 1
         return False
 
     sess_id_len = handshake[SESSION_ID_LEN_POS]
-    sess_id = handshake[SESSION_ID_POS: SESSION_ID_POS + sess_id_len]
+    sess_id = handshake[SESSION_ID_POS:SESSION_ID_POS+sess_id_len]
 
     for user in config.USERS:
         secret = bytes.fromhex(config.USERS[user])
@@ -1111,9 +1127,12 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
 
         timestamp = int.from_bytes(xored_digest[-4:], "little")
         client_time_is_ok = TIME_SKEW_MIN < time.time() - timestamp < TIME_SKEW_MAX
+
         # some clients fail to read unix time and send the time since boot instead
         client_time_is_small = timestamp < 60*60*24*1000
-        if not client_time_is_ok and not is_time_skewed and not client_time_is_small:
+        accept_bad_time = config.IGNORE_TIME_SKEW or is_time_skewed or client_time_is_small
+
+        if not client_time_is_ok and not accept_bad_time:
             last_clients_with_time_skew[peer[0]] = (time.time() - timestamp) // 60
             continue
 
@@ -1219,9 +1238,11 @@ async def handle_handshake(reader, writer):
         return False
 
     peer = writer.get_extra_info("peername")[:2]
+    if not peer:
+        peer = ("unknown ip", 0)
 
     if config.PROXY_PROTOCOL:
-        ip = peer[0] if peer else "unknown address"
+        ip = peer[0] if peer else "unknown ip"
         peer = await handle_proxy_protocol(reader, peer)
         if not peer:
             print_err("Client from %s sent bad proxy protocol headers" % ip)
@@ -1540,6 +1561,32 @@ async def do_middleproxy_handshake(proto_tag, dc_idx, cl_ip, cl_port):
     return reader_tgt, writer_tgt
 
 
+async def tg_connect_reader_to_writer(rd, wr, user, rd_buf_size, is_upstream):
+    try:
+        while True:
+            data = await rd.read(rd_buf_size)
+            if isinstance(data, tuple):
+                data, extra = data
+            else:
+                extra = {}
+
+            if not data:
+                wr.write_eof()
+                await wr.drain()
+                return
+            else:
+                if is_upstream:
+                    update_user_stats(user, octets_from_client=len(data), msgs_from_client=1)
+                else:
+                    update_user_stats(user, octets_to_client=len(data), msgs_to_client=1)
+
+                wr.write(data, extra)
+                await wr.drain()
+    except (OSError, asyncio.IncompleteReadError) as e:
+        # print_err(e)
+        pass
+
+
 async def handle_client(reader_clt, writer_clt):
     set_keepalive(writer_clt.get_extra_info("socket"), config.CLIENT_KEEPALIVE, attempts=3)
     set_ack_timeout(writer_clt.get_extra_info("socket"), config.CLIENT_ACK_TIMEOUT)
@@ -1602,29 +1649,10 @@ async def handle_client(reader_clt, writer_clt):
         else:
             return
 
-    async def connect_reader_to_writer(rd, wr, user, rd_buf_size):
-        try:
-            while True:
-                data = await rd.read(rd_buf_size)
-                if isinstance(data, tuple):
-                    data, extra = data
-                else:
-                    extra = {}
-
-                if not data:
-                    wr.write_eof()
-                    await wr.drain()
-                    return
-                else:
-                    update_user_stats(user, octets=len(data), msgs=1)
-                    wr.write(data, extra)
-                    await wr.drain()
-        except (OSError, asyncio.IncompleteReadError) as e:
-            # print_err(e)
-            pass
-
-    tg_to_clt = connect_reader_to_writer(reader_tg, writer_clt, user, get_to_clt_bufsize())
-    clt_to_tg = connect_reader_to_writer(reader_clt, writer_tg, user, get_to_tg_bufsize())
+    tg_to_clt = tg_connect_reader_to_writer(reader_tg, writer_clt, user,
+                                            get_to_clt_bufsize(), False)
+    clt_to_tg = tg_connect_reader_to_writer(reader_clt, writer_tg,
+                                            user, get_to_tg_bufsize(), True)
     task_tg_to_clt = asyncio.ensure_future(tg_to_clt)
     task_clt_to_tg = asyncio.ensure_future(clt_to_tg)
 
@@ -1642,7 +1670,8 @@ async def handle_client(reader_clt, writer_clt):
 
     user_data_quota_hit = (
         user in config.USER_DATA_QUOTA and
-        user_stats[user]["octets"] > config.USER_DATA_QUOTA[user]
+        (user_stats[user]["octets_to_client"] +
+         user_stats[user]["octets_from_client"] > config.USER_DATA_QUOTA[user])
     )
 
     if (not tcp_limit_hit) and (not user_expired) and (not user_data_quota_hit):
@@ -1663,7 +1692,7 @@ async def handle_client_wrapper(reader, writer):
         await handle_client(reader, writer)
     except (asyncio.IncompleteReadError, asyncio.CancelledError):
         pass
-    except (ConnectionResetError, TimeoutError):
+    except (ConnectionResetError, TimeoutError, BrokenPipeError):
         pass
     except Exception:
         traceback.print_exc()
@@ -1696,6 +1725,7 @@ def make_metrics_pkt(metrics):
 
     pkt_header_list = []
     pkt_header_list.append("HTTP/1.1 200 OK")
+    pkt_header_list.append("Connection: close")
     pkt_header_list.append("Content-Length: %d" % len(pkt_body))
     pkt_header_list.append("Content-Type: text/plain; version=0.0.4; charset=utf-8")
     pkt_header_list.append("Date: %s" % time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime()))
@@ -1749,13 +1779,25 @@ async def handle_metrics(reader, writer):
         user_metrics_desc = [
             ["user_connects", "counter", "user connects", "connects"],
             ["user_connects_curr", "gauge", "current user connects", "curr_connects"],
-            ["user_octets", "counter", "octets proxied for user", "octets"],
-            ["user_msgs", "counter", "msgs proxied for user", "msgs"],
+            ["user_octets", "counter", "octets proxied for user",
+                "octets_from_client+octets_to_client"],
+            ["user_msgs", "counter", "msgs proxied for user",
+                "msgs_from_client+msgs_to_client"],
+            ["user_octets_from", "counter", "octets proxied from user", "octets_from_client"],
+            ["user_octets_to", "counter", "octets proxied to user", "octets_to_client"],
+            ["user_msgs_from", "counter", "msgs proxied from user", "msgs_from_client"],
+            ["user_msgs_to", "counter", "msgs proxied to user", "msgs_to_client"],
         ]
 
         for m_name, m_type, m_desc, stat_key in user_metrics_desc:
             for user, stat in user_stats.items():
-                metric = {"user": user, "val": stat[stat_key]}
+                if "+" in stat_key:
+                    val = 0
+                    for key_part in stat_key.split("+"):
+                        val += stat[key_part]
+                else:
+                    val = stat[stat_key]
+                metric = {"user": user, "val": val}
                 metrics.append([m_name, m_type, m_desc, metric])
 
         pkt = make_metrics_pkt(metrics)
@@ -1781,7 +1823,8 @@ async def stats_printer():
         for user, stat in user_stats.items():
             print("%s: %d connects (%d current), %.2f MB, %d msgs" % (
                 user, stat["connects"], stat["curr_connects"],
-                stat["octets"] / 1000000, stat["msgs"]))
+                (stat["octets_from_client"] + stat["octets_to_client"]) / 1000000,
+                stat["msgs_from_client"] + stat["msgs_to_client"]))
         print(flush=True)
 
         if last_client_ips:
@@ -2064,9 +2107,12 @@ def print_tg_info():
             print("Since you have TLS only mode enabled the best port is 443", flush=True)
         print_default_warning = True
 
-    ip_addrs = [ip for ip in my_ip_info.values() if ip]
-    if not ip_addrs:
-        ip_addrs = ["YOUR_IP"]
+    if not config.MY_DOMAIN:
+        ip_addrs = [ip for ip in my_ip_info.values() if ip]
+        if not ip_addrs:
+            ip_addrs = ["YOUR_IP"]
+    else:
+        ip_addrs = [config.MY_DOMAIN]
 
     proxy_links = []
 
@@ -2126,6 +2172,11 @@ def setup_files_limit():
         pass
 
 
+def setup_asyncio():
+    # get rid of annoying "socket.send() raised exception" log messages
+    asyncio.constants.LOG_THRESHOLD_FOR_CONNLOST_WRITES = 100
+
+
 def setup_signals():
     if hasattr(signal, 'SIGUSR1'):
         def debug_signal(signum, frame):
@@ -2137,6 +2188,7 @@ def setup_signals():
     if hasattr(signal, 'SIGUSR2'):
         def reload_signal(signum, frame):
             init_config()
+            ensure_users_in_user_stats()
             apply_upstream_proxy_settings()
             print("Config reloaded", flush=True, file=sys.stderr)
             print_tg_info()
@@ -2192,41 +2244,11 @@ def loop_exception_handler(loop, context):
     loop.default_exception_handler(context)
 
 
-def main():
-    setup_files_limit()
-    setup_signals()
-    try_setup_uvloop()
-
-    init_stats()
-    init_proxy_start_time()
-
-    if sys.platform == "win32":
-        loop = asyncio.ProactorEventLoop()
-        asyncio.set_event_loop(loop)
-
-    loop = asyncio.get_event_loop()
-    loop.set_exception_handler(loop_exception_handler)
-
-    stats_printer_task = asyncio.Task(stats_printer())
-    asyncio.ensure_future(stats_printer_task)
-
-    if config.USE_MIDDLE_PROXY:
-        middle_proxy_updater_task = asyncio.Task(update_middle_proxy_info())
-        asyncio.ensure_future(middle_proxy_updater_task)
-
-        if config.GET_TIME_PERIOD:
-            time_get_task = asyncio.Task(get_srv_time())
-            asyncio.ensure_future(time_get_task)
-
-    get_cert_len_task = asyncio.Task(get_mask_host_cert_len())
-    asyncio.ensure_future(get_cert_len_task)
-
-    clear_resolving_cache_task = asyncio.Task(clear_ip_resolving_cache())
-    asyncio.ensure_future(clear_resolving_cache_task)
+def create_servers(loop):
+    servers = []
 
     reuse_port = hasattr(socket, "SO_REUSEPORT")
     has_unix = hasattr(socket, "AF_UNIX")
-    servers = []
 
     if config.LISTEN_ADDR_IPV4:
         task = asyncio.start_server(handle_client_wrapper, config.LISTEN_ADDR_IPV4, config.PORT,
@@ -2255,17 +2277,78 @@ def main():
                                         config.METRICS_PORT)
             servers.append(loop.run_until_complete(task))
 
+    return servers
+
+
+def create_utilitary_tasks(loop):
+    tasks = []
+
+    stats_printer_task = asyncio.Task(stats_printer())
+    tasks.append(stats_printer_task)
+
+    if config.USE_MIDDLE_PROXY:
+        middle_proxy_updater_task = asyncio.Task(update_middle_proxy_info())
+        tasks.append(middle_proxy_updater_task)
+
+        if config.GET_TIME_PERIOD:
+            time_get_task = asyncio.Task(get_srv_time())
+            tasks.append(time_get_task)
+
+    get_cert_len_task = asyncio.Task(get_mask_host_cert_len())
+    tasks.append(get_cert_len_task)
+
+    clear_resolving_cache_task = asyncio.Task(clear_ip_resolving_cache())
+    tasks.append(clear_resolving_cache_task)
+
+    return tasks
+
+
+def main():
+    init_config()
+    ensure_users_in_user_stats()
+    apply_upstream_proxy_settings()
+    init_ip_info()
+    print_tg_info()
+
+    setup_asyncio()
+    setup_files_limit()
+    setup_signals()
+    try_setup_uvloop()
+
+    init_proxy_start_time()
+
+    if sys.platform == "win32":
+        loop = asyncio.ProactorEventLoop()
+        asyncio.set_event_loop(loop)
+
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(loop_exception_handler)
+
+    utilitary_tasks = create_utilitary_tasks(loop)
+    for task in utilitary_tasks:
+        asyncio.ensure_future(task)
+
+    servers = create_servers(loop)
+
     try:
         loop.run_forever()
     except KeyboardInterrupt:
         pass
 
-    for task in asyncio.Task.all_tasks():
+    if hasattr(asyncio, "all_tasks"):
+        tasks = asyncio.all_tasks(loop)
+    else:
+        # for compatibility with Python 3.6
+        tasks = asyncio.Task.all_tasks(loop)
+
+    for task in tasks:
         task.cancel()
 
     for server in servers:
         server.close()
         loop.run_until_complete(server.wait_closed())
+
+    has_unix = hasattr(socket, "AF_UNIX")
 
     if config.LISTEN_UNIX_SOCK and has_unix:
         remove_unix_socket(config.LISTEN_UNIX_SOCK)
@@ -2274,8 +2357,4 @@ def main():
 
 
 if __name__ == "__main__":
-    init_config()
-    apply_upstream_proxy_settings()
-    init_ip_info()
-    print_tg_info()
     main()
